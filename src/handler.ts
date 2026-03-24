@@ -9,6 +9,11 @@ import { createResponse, QueryRequest, QueryTransactionRequest } from './utils'
 import { dumpDatabaseRoute } from './export/dump'
 import { exportTableToJsonRoute } from './export/json'
 import { exportTableToCsvRoute } from './export/csv'
+import {
+    startChunkedDumpRoute,
+    getExportStatusRoute,
+    downloadExportRoute,
+} from './export/chunked'
 import { importDumpRoute } from './import/dump'
 import { importTableFromJsonRoute } from './import/json'
 import { importTableFromCsvRoute } from './import/csv'
@@ -123,6 +128,47 @@ export class StarbaseDB {
             this.app.get('/export/dump', this.isInternalSource, async () => {
                 return dumpDatabaseRoute(this.dataSource, this.config)
             })
+
+            this.app.post(
+                '/export/dump/start',
+                this.isInternalSource,
+                async (c) => {
+                    return startChunkedDumpRoute(
+                        c.req.raw,
+                        this.dataSource,
+                        this.config
+                    )
+                }
+            )
+
+            this.app.get(
+                '/export/status/:jobId',
+                this.isInternalSource,
+                async (c) => {
+                    const jobId = c.req.param('jobId')
+                    return getExportStatusRoute(
+                        jobId,
+                        c.req.raw,
+                        this.dataSource,
+                        this.config
+                    )
+                }
+            )
+
+            this.app.get(
+                '/export/download/:jobId',
+                this.isInternalSource,
+                async (c) => {
+                    const jobId = c.req.param('jobId')
+                    return downloadExportRoute(
+                        jobId,
+                        c.req.raw,
+                        this.dataSource,
+                        this.config,
+                        this.dataSource.r2
+                    )
+                }
+            )
 
             this.app.get(
                 '/export/json/:tableName',

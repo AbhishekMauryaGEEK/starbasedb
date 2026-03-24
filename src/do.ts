@@ -1,4 +1,5 @@
 import { DurableObject } from 'cloudflare:workers'
+import { isCallbackUrlSafe, quoteIdentifier } from './utils'
 
 export class StarbaseDBDurableObject extends DurableObject {
     // Durable storage for the SQL database
@@ -9,6 +10,8 @@ export class StarbaseDBDurableObject extends DurableObject {
     public connections = new Map<string, WebSocket>()
     // Store the client auth token for requests back to our Worker
     private clientAuthToken: string
+    // Optional R2 bucket for storing large export files
+    private r2?: R2Bucket
 
     /**
      * The constructor is invoked once upon creation of the Durable Object, i.e. the first call to
@@ -22,6 +25,7 @@ export class StarbaseDBDurableObject extends DurableObject {
         this.clientAuthToken = env.CLIENT_AUTHORIZATION_TOKEN
         this.sql = ctx.storage.sql
         this.storage = ctx.storage
+        this.r2 = (env as any).EXPORT_R2_BUCKET
 
         // Install default necessary `tmp_` tables for various features here.
         const cacheStatement = `
@@ -59,10 +63,36 @@ export class StarbaseDBDurableObject extends DurableObject {
             "operator" TEXT DEFAULT '='
         )`
 
+        const exportJobsStatement = `
+        CREATE TABLE IF NOT EXISTS tmp_export_jobs (
+            id TEXT PRIMARY KEY,
+            token_hash TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            file_name TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            total_tables INTEGER NOT NULL DEFAULT 0,
+            processed_tables INTEGER NOT NULL DEFAULT 0,
+            current_table TEXT,
+            current_offset INTEGER NOT NULL DEFAULT 0,
+            callback_url TEXT,
+            error TEXT,
+            content TEXT
+        )`
+
+        const exportRateLimitsStatement = `
+        CREATE TABLE IF NOT EXISTS tmp_export_rate_limits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token_hash TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        )`
+
         this.executeQuery({ sql: cacheStatement })
         this.executeQuery({ sql: allowlistStatement })
         this.executeQuery({ sql: allowlistRejectedStatement })
         this.executeQuery({ sql: rlsStatement })
+        this.executeQuery({ sql: exportJobsStatement })
+        this.executeQuery({ sql: exportRateLimitsStatement })
     }
 
     init() {
@@ -105,6 +135,15 @@ export class StarbaseDBDurableObject extends DurableObject {
     }
 
     async alarm() {
+        // First, continue any pending export jobs before processing cron tasks.
+        // Export jobs are time-sensitive and must resume from their saved checkpoint.
+        const exportResumed = await this.continueExportJobs()
+        if (exportResumed) {
+            // More export work is still pending; do not process cron this cycle
+            // so that the export alarm can fire again in ~1 second.
+            return
+        }
+
         try {
             // Fetch all the tasks that are marked to emit an event for this cycle.
             const task = (await this.executeQuery({
@@ -145,6 +184,202 @@ export class StarbaseDBDurableObject extends DurableObject {
             } catch (retryError) {
                 console.error('Failed to set recovery alarm:', retryError)
             }
+        }
+    }
+
+    /**
+     * Resume any export jobs that are in a 'pending' or 'processing' state.
+     * Called at the start of every alarm() invocation so that large exports
+     * can continue across multiple Durable Object activations.
+     *
+     * Returns true if an export job was found and needs more processing
+     * (alarm will be rescheduled for 1 second later), false otherwise.
+     */
+    private async continueExportJobs(): Promise<boolean> {
+        try {
+            const jobs = (await this.executeQuery({
+                sql: `SELECT * FROM tmp_export_jobs
+                      WHERE status IN ('pending', 'processing')
+                      ORDER BY created_at ASC LIMIT 1`,
+                isRaw: false,
+            })) as Record<string, SqlStorageValue>[]
+
+            if (!jobs.length) {
+                return false
+            }
+
+            const job = jobs[0]
+            const jobId = job.id as string
+            const startTime = Date.now()
+            const MAX_MS = 25_000
+            const CHUNK = 1000
+
+            // Mark as processing
+            await this.executeQuery({
+                sql: `UPDATE tmp_export_jobs
+                      SET status = 'processing', updated_at = ?
+                      WHERE id = ? AND status IN ('pending', 'processing')`,
+                params: [Date.now(), jobId],
+            })
+
+            // Enumerate user tables
+            const tableRows = (await this.executeQuery({
+                sql: "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'tmp_%';",
+                isRaw: false,
+            })) as Record<string, SqlStorageValue>[]
+            const allTables = tableRows.map((r) => String(r.name))
+
+            let processedTables = Number(job.processed_tables ?? 0)
+            let currentOffset = Number(job.current_offset ?? 0)
+            let dumpContent = ''
+            let timedOut = false
+
+            for (
+                let tableIdx = processedTables;
+                tableIdx < allTables.length;
+                tableIdx++
+            ) {
+                if (Date.now() - startTime >= MAX_MS) {
+                    timedOut = true
+                    await this.executeQuery({
+                        sql: `UPDATE tmp_export_jobs
+                              SET processed_tables = ?, current_table = ?,
+                                  current_offset = ?, updated_at = ?
+                              WHERE id = ?`,
+                        params: [
+                            tableIdx,
+                            allTables[tableIdx],
+                            currentOffset,
+                            Date.now(),
+                            jobId,
+                        ],
+                    })
+                    break
+                }
+
+                const table = allTables[tableIdx]
+
+                if (currentOffset === 0) {
+                    const schemaRows = (await this.executeQuery({
+                        sql: `SELECT sql FROM sqlite_master WHERE type='table' AND name=?`,
+                        params: [table],
+                        isRaw: false,
+                    })) as Record<string, SqlStorageValue>[]
+                    if (schemaRows.length && schemaRows[0].sql) {
+                        dumpContent += `\n-- Table: ${table}\n${schemaRows[0].sql};\n\n`
+                    }
+                }
+
+                while (true) {
+                    if (Date.now() - startTime >= MAX_MS) {
+                        timedOut = true
+                        await this.executeQuery({
+                            sql: `UPDATE tmp_export_jobs
+                                  SET processed_tables = ?, current_table = ?,
+                                      current_offset = ?, updated_at = ?
+                                  WHERE id = ?`,
+                            params: [
+                                tableIdx,
+                                table,
+                                currentOffset,
+                                Date.now(),
+                                jobId,
+                            ],
+                        })
+                        break
+                    }
+
+                    const dataRows = (await this.executeQuery({
+                        sql: `SELECT * FROM ${quoteIdentifier(table)} LIMIT ? OFFSET ?`,
+                        params: [CHUNK, currentOffset],
+                        isRaw: false,
+                    })) as Record<string, SqlStorageValue>[]
+
+                    if (dataRows.length === 0) {
+                        currentOffset = 0
+                        break
+                    }
+
+                    for (const row of dataRows) {
+                        const values = Object.values(row).map((v) =>
+                            v === null
+                                ? 'NULL'
+                                : typeof v === 'string'
+                                  ? `'${v.replace(/'/g, "''")}'`
+                                  : v
+                        )
+                        dumpContent += `INSERT INTO ${quoteIdentifier(table)} VALUES (${values.join(', ')});\n`
+                    }
+
+                    currentOffset += dataRows.length
+                    if (dataRows.length < CHUNK) {
+                        currentOffset = 0
+                        break
+                    }
+                }
+
+                if (timedOut) break
+                processedTables = tableIdx + 1
+                currentOffset = 0
+                dumpContent += '\n'
+            }
+
+            if (dumpContent) {
+                if (this.r2) {
+                    // NOTE: Read-modify-write is adequate for moderate-sized exports.
+                    // For very large databases consider R2 multipart uploads to avoid
+                    // loading the full existing object into memory on each chunk.
+                    const existing = await this.r2.get(String(job.file_name))
+                    const existingText = existing ? await existing.text() : ''
+                    await this.r2.put(
+                        String(job.file_name),
+                        existingText + dumpContent
+                    )
+                } else {
+                    await this.executeQuery({
+                        sql: `UPDATE tmp_export_jobs
+                              SET content = content || ?, updated_at = ?
+                              WHERE id = ?`,
+                        params: [dumpContent, Date.now(), jobId],
+                    })
+                }
+            }
+
+            if (!timedOut) {
+                await this.executeQuery({
+                    sql: `UPDATE tmp_export_jobs
+                          SET status = 'completed', processed_tables = ?,
+                              current_table = NULL, current_offset = 0, updated_at = ?
+                          WHERE id = ?`,
+                    params: [allTables.length, Date.now(), jobId],
+                })
+
+                const callbackUrl = job.callback_url as string | null
+                // Re-validate the callback URL as defense-in-depth (SSRF prevention)
+                if (callbackUrl && isCallbackUrlSafe(callbackUrl)) {
+                    try {
+                        await fetch(callbackUrl, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                event: 'export.completed',
+                                jobId,
+                                fileName: job.file_name,
+                            }),
+                        })
+                    } catch (err) {
+                        console.error('Export callback failed:', err)
+                    }
+                }
+                return false
+            }
+
+            // More work needed – reschedule alarm
+            await this.setAlarm(Date.now() + 1000)
+            return true
+        } catch (e) {
+            console.error('Error continuing export job:', e)
+            return false
         }
     }
 

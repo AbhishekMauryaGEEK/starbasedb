@@ -56,6 +56,9 @@ export interface Env {
 
     HYPERDRIVE: Hyperdrive
 
+    /** Optional R2 bucket for storing large export files. */
+    EXPORT_R2_BUCKET?: R2Bucket
+
     // ## DO NOT REMOVE: TEMPLATE INTERFACE ##
 }
 
@@ -121,6 +124,7 @@ export default {
                     ...context,
                 },
                 executionContext: ctx,
+                r2: env.EXPORT_R2_BUCKET,
             }
 
             if (env.EXTERNAL_DB_TYPE === 'postgresql') {

@@ -13,4 +13,6 @@ interface Env {
     DATABASE_DURABLE_OBJECT: DurableObjectNamespace<
         import('./src/index').StarbaseDBDurableObject
     >
+    /** Optional R2 bucket for storing large export files (see wrangler.toml). */
+    EXPORT_R2_BUCKET?: R2Bucket
 }

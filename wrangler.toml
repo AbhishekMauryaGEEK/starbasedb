@@ -33,6 +33,13 @@ class_name = "StarbaseDBDurableObject"
 tag = "v1"
 new_sqlite_classes = ["StarbaseDBDurableObject"]
 
+# Uncomment the section below to enable R2 storage for large database exports.
+# Exports exceeding the 30-second Worker execution window will be stored in R2
+# and can be downloaded via GET /export/download/:jobId after completion.
+# [[r2_buckets]]
+# binding = "EXPORT_R2_BUCKET"
+# bucket_name = "starbasedb-exports"
+
 [vars]
 # Use this in your Authorization header for full database access
 ADMIN_AUTHORIZATION_TOKEN = "ABC123"
